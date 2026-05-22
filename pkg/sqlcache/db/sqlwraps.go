@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
 	"time"
 
 	"github.com/rancher/steve/pkg/sqlcache/db/logging"
@@ -15,7 +16,55 @@ const (
 
 	// slowWriteQueryThreshold is the duration after which a write query is considered slow.
 	slowWriteQueryThreshold = 30 * time.Second
+
+	// slowQueryCheckInterval is how often to log while a slow query is still running.
+	slowQueryCheckInterval = 1 * time.Minute
 )
+
+// queryIDCounter is used to generate unique query IDs for tracking.
+var queryIDCounter atomic.Uint64
+
+// slowQueryMonitor monitors a query and logs warnings if it exceeds the threshold.
+// It continues logging every slowQueryCheckInterval while the query is still running.
+// Returns a function to call when the query completes.
+func slowQueryMonitor(queryType string, threshold time.Duration, query string) (cancel func()) {
+	done := make(chan struct{})
+	start := time.Now()
+	queryID := queryIDCounter.Add(1)
+
+	go func() {
+		// Wait for initial threshold
+		timer := time.NewTimer(threshold)
+		select {
+		case <-timer.C:
+			elapsed := time.Since(start)
+			logrus.Warnf("Slow %s query detected (query_id=%d, running for %v, threshold: %v): %s",
+				queryType, queryID, elapsed.Round(time.Millisecond), threshold, query)
+		case <-done:
+			timer.Stop()
+			return
+		}
+
+		// Continue logging every interval while still running
+		ticker := time.NewTicker(slowQueryCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(start)
+				logrus.Warnf("Slow %s query still running (query_id=%d, running for %v): %s",
+					queryType, queryID, elapsed.Round(time.Millisecond), query)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+	}
+}
 
 // Row implements a subset of the methods provided by sql.Row
 type Row interface {
@@ -77,25 +126,10 @@ func (s *stmt) log(startTime time.Time, query string, args []any) {
 
 func (s *stmt) Exec(args ...any) (sql.Result, error) {
 	start := time.Now()
-	done := make(chan struct{})
-
-	// Monitor for slow write queries
-	go func() {
-		timer := time.NewTimer(slowWriteQueryThreshold)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			elapsed := time.Since(start)
-			logrus.Warnf("Slow write query detected (running for %v, threshold: %v): %s",
-				elapsed.Round(time.Millisecond), slowWriteQueryThreshold, s.queryString)
-		case <-done:
-			return
-		}
-	}()
+	cancelMonitor := slowQueryMonitor("write", slowWriteQueryThreshold, s.queryString)
 
 	defer func() {
-		close(done)
+		cancelMonitor()
 		s.log(start, s.queryString, args)
 	}()
 
@@ -111,25 +145,10 @@ func (s *stmt) Exec(args ...any) (sql.Result, error) {
 
 func (s *stmt) QueryContext(ctx context.Context, args ...any) (Rows, error) {
 	start := time.Now()
-	done := make(chan struct{})
-
-	// Monitor for slow read queries
-	go func() {
-		timer := time.NewTimer(slowReadQueryThreshold)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			elapsed := time.Since(start)
-			logrus.Warnf("Slow read query detected (running for %v, threshold: %v): %s",
-				elapsed.Round(time.Millisecond), slowReadQueryThreshold, s.queryString)
-		case <-done:
-			return
-		}
-	}()
+	cancelMonitor := slowQueryMonitor("read", slowReadQueryThreshold, s.queryString)
 
 	defer func() {
-		close(done)
+		cancelMonitor()
 		s.log(start, s.queryString, args)
 	}()
 
