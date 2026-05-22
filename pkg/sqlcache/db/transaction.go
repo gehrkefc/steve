@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/rancher/steve/pkg/sqlcache/db/logging"
+	"github.com/sirupsen/logrus"
 )
 
 // TxClient is an interface over a subset of sql.Tx methods
@@ -42,7 +43,29 @@ func NewTxClient(tx Tx, opts ...TxClientOption) TxClient {
 }
 
 func (c txClient) Exec(query string, args ...any) (sql.Result, error) {
-	defer c.queryLogger.Log(time.Now(), query, args)
+	start := time.Now()
+	done := make(chan struct{})
+
+	// Monitor for slow write queries
+	go func() {
+		timer := time.NewTimer(slowWriteQueryThreshold)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			elapsed := time.Since(start)
+			logrus.Warnf("Slow write query detected (running for %v, threshold: %v): %s",
+				elapsed.Round(time.Millisecond), slowWriteQueryThreshold, query)
+		case <-done:
+			return
+		}
+	}()
+
+	defer func() {
+		close(done)
+		c.queryLogger.Log(start, query, args)
+	}()
+
 	res, err := c.tx.Exec(query, args...)
 	if err != nil {
 		err = &QueryError{

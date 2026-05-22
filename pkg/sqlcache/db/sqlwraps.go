@@ -6,6 +6,15 @@ import (
 	"time"
 
 	"github.com/rancher/steve/pkg/sqlcache/db/logging"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	// slowReadQueryThreshold is the duration after which a read query is considered slow.
+	slowReadQueryThreshold = 5 * time.Second
+
+	// slowWriteQueryThreshold is the duration after which a write query is considered slow.
+	slowWriteQueryThreshold = 30 * time.Second
 )
 
 // Row implements a subset of the methods provided by sql.Row
@@ -67,7 +76,29 @@ func (s *stmt) log(startTime time.Time, query string, args []any) {
 }
 
 func (s *stmt) Exec(args ...any) (sql.Result, error) {
-	defer s.log(time.Now(), s.queryString, args)
+	start := time.Now()
+	done := make(chan struct{})
+
+	// Monitor for slow write queries
+	go func() {
+		timer := time.NewTimer(slowWriteQueryThreshold)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			elapsed := time.Since(start)
+			logrus.Warnf("Slow write query detected (running for %v, threshold: %v): %s",
+				elapsed.Round(time.Millisecond), slowWriteQueryThreshold, s.queryString)
+		case <-done:
+			return
+		}
+	}()
+
+	defer func() {
+		close(done)
+		s.log(start, s.queryString, args)
+	}()
+
 	res, err := s.Stmt.Exec(args...)
 	if err != nil {
 		err = &QueryError{
@@ -79,7 +110,29 @@ func (s *stmt) Exec(args ...any) (sql.Result, error) {
 }
 
 func (s *stmt) QueryContext(ctx context.Context, args ...any) (Rows, error) {
-	defer s.log(time.Now(), s.queryString, args)
+	start := time.Now()
+	done := make(chan struct{})
+
+	// Monitor for slow read queries
+	go func() {
+		timer := time.NewTimer(slowReadQueryThreshold)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			elapsed := time.Since(start)
+			logrus.Warnf("Slow read query detected (running for %v, threshold: %v): %s",
+				elapsed.Round(time.Millisecond), slowReadQueryThreshold, s.queryString)
+		case <-done:
+			return
+		}
+	}()
+
+	defer func() {
+		close(done)
+		s.log(start, s.queryString, args)
+	}()
+
 	res, err := s.Stmt.QueryContext(ctx, args...)
 	if err != nil {
 		return res, &QueryError{
