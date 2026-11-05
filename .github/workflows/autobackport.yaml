@@ -17,7 +17,7 @@ on:
       - created
   # Re-engage Copilot when a backport PR's CI run finishes unsuccessfully.
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI", "Integration tests"]
     types:
       - completed
 
@@ -199,8 +199,8 @@ jobs:
               '',
               '### What to do',
               `1. Cherry-pick \`${mergeSha}\` onto this branch and resolve the conflicts. Keep the diff minimal and faithful to the original PR — no unrelated changes.`,
-              `2. Reproduce the CI checks locally to confirm your fix actually works *before* pushing — each push you make requires a maintainer to approve the PR's CI, so avoid blind push-and-wait loops. Run the same steps CI runs: \`make build-bin\`, \`make test\` (install \`setup-envtest\` first, as CI does), and \`make validate\` (needs golangci-lint v2.14.0). Make sure the specific failure is resolved.`,
-              `3. Push a single commit, then post a comment summarizing what you changed and which checks you ran locally and their results, so the maintainer can approve CI with confidence. Once this PR's CI is approved and green, mark it ready for review.`,
+              `2. Reproduce the CI checks locally to confirm your fix actually works *before* pushing — each push you make requires a maintainer to approve the PR's CI, so avoid blind push-and-wait loops. Run the same steps CI runs: \`make build-bin\`, \`make test\` (install \`setup-envtest\` first, as CI does), \`make validate\` (needs golangci-lint v2.14.0), and \`make integration-tests\` (needs k3d via \`./scripts/install-k3d.sh\` and Docker). If the integration tests cannot run in your environment, say so rather than guessing. Make sure the specific failure is resolved.`,
+              `3. Push a single commit, then post a comment that **explicitly states you ran the CI checks locally and they passed** — list each one (e.g. "ran \`make build-bin\`, \`make test\`, \`make validate\`, \`make integration-tests\` locally, all green") along with a short summary of what you changed, so the maintainer can approve CI with confidence. Once this PR's CI is approved and green, mark it ready for review.`,
               `4. Some steve tests are flaky, especially on older release branches. If a failure is clearly unrelated to the backported change (e.g. a known flaky integration test), say so in your comment rather than over-engineering a fix for it.`,
               '',
               '> **Note for maintainers:** GitHub holds CI on commits pushed by the Copilot agent in an "action required" state. A maintainer must click **"Approve and run workflows"** on this PR after each Copilot push before CI will run.',
@@ -369,7 +369,7 @@ jobs:
               body: [
                 `:robot: @copilot the CI checks on this backport still failed after ${maxAttempts} attempts (${process.env.RUN_URL}), so this is unlikely to be a flake.`,
                 '',
-                'Please fix the failing checks, keeping changes minimal and faithful to the original PR. Reproduce the CI checks locally to confirm your fix works *before* pushing — each push you make requires a maintainer to approve the PR\'s CI, so avoid blind push-and-wait loops. Run the same steps CI runs: `make build-bin`, `make test` (install `setup-envtest` first, as CI does), and `make validate` (needs golangci-lint v2.14.0). Then push a single commit and post a comment summarizing what you changed and which checks you ran locally and their results, so the maintainer can approve CI with confidence. Once CI is approved and green, mark the PR ready for review. Some steve tests are flaky on older release branches — if a failure is clearly unrelated to the backported change, say so rather than over-engineering a fix.',
+                'Please fix the failing checks, keeping changes minimal and faithful to the original PR. Reproduce the CI checks locally to confirm your fix works *before* pushing — each push you make requires a maintainer to approve the PR\'s CI, so avoid blind push-and-wait loops. Run the same steps CI runs: `make build-bin`, `make test` (install `setup-envtest` first, as CI does), `make validate` (needs golangci-lint v2.14.0), and `make integration-tests` (needs k3d via `./scripts/install-k3d.sh` and Docker). Then push a single commit and post a comment that **explicitly states you ran the CI checks locally and they passed** — list each one you ran and its result, plus a short summary of what you changed, so the maintainer can approve CI with confidence. If a check (e.g. the integration tests) cannot run in your environment, say so rather than guessing. Once CI is approved and green, mark the PR ready for review. Some steve tests are flaky on older release branches — if a failure is clearly unrelated to the backported change, say so rather than over-engineering a fix.',
                 '',
                 '> **Note for maintainers:** GitHub holds CI on commits pushed by the Copilot agent in an "action required" state. A maintainer must click **"Approve and run workflows"** on this PR after each Copilot push before CI will run.',
                 '',
