@@ -199,7 +199,8 @@ jobs:
               '',
               '### What to do',
               `1. Cherry-pick \`${mergeSha}\` onto this branch and resolve the conflicts. Keep the diff minimal and faithful to the original PR — no unrelated changes.`,
-              `2. Make sure this PR's CI checks pass, then mark it ready for review and summarize what you changed.`,
+              `2. Do a quick local sanity check only (e.g. \`go build ./...\` and \`go vet ./...\` for the packages you touched). Do not try to reproduce the full CI suite (envtest, golangci-lint, go generate) in your workspace — it is slow and flaky. Push your commit and let this PR's own CI be the source of truth.`,
+              `3. Once this PR's CI is green, mark it ready for review and summarize what you changed. If CI reports a real failure, iterate.`,
               '',
               '### If you get stuck',
               'If the conflicts are too deep to resolve confidently (the code has diverged substantially on this branch, or a correct fix needs product decisions), **do not force a broken backport**. Leave this PR as a draft and comment explaining exactly what is blocking it so a human can take over.',
@@ -365,7 +366,7 @@ jobs:
               body: [
                 `:robot: @copilot the CI checks on this backport still failed after ${maxAttempts} attempts (${process.env.RUN_URL}), so this is unlikely to be a flake.`,
                 '',
-                'Please fix the failing checks, keeping changes minimal and faithful to the original PR. When green, mark this PR ready for review and summarize what you changed.',
+                'Please fix the failing checks, keeping changes minimal and faithful to the original PR. Do a quick local sanity check only (e.g. `go build ./...` and `go vet ./...` for the packages you touched) — do not try to reproduce the full CI suite (envtest, golangci-lint, go generate) in your workspace, it is slow and flaky. Push your fix and let this PR\'s own CI validate it; once it is green, mark the PR ready for review and summarize what you changed.',
                 '',
                 'If the failures are too deep to resolve confidently, leave this PR as a draft and comment explaining what is blocking it so a human can take over.',
               ].join('\n'),
