@@ -145,6 +145,11 @@ jobs:
           BACKPORT_BRANCH: ${{ steps.prepare.outputs.backport_branch }}
           PR_TITLE: ${{ steps.prepare.outputs.pr_title }}
         with:
+          # Assigning the Copilot coding agent requires a user/PAT token; the default
+          # GITHUB_TOKEN cannot assign it. Provide a PAT with `repo` scope (and Copilot
+          # access) as the AUTOBACKPORT_TOKEN secret. Falls back to GITHUB_TOKEN, in
+          # which case the PR is still opened but Copilot must be assigned manually.
+          github-token: ${{ secrets.AUTOBACKPORT_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.issue.number;
