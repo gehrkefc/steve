@@ -6,7 +6,8 @@ run-name: "Autobackport PR #${{ github.event.issue.number }}"
 # squashed merge commit:
 #   * Clean cherry-pick  -> a normal PR is opened; its own CI checks validate it.
 #   * Merge conflict      -> a draft PR is opened and assigned to Copilot.
-#   * CI checks then fail -> the PR is assigned to Copilot to fix them.
+#   * CI checks then fail -> the CI is retried a couple of times to rule out flakes,
+#                            and only if it keeps failing is the PR handed to Copilot.
 # Copilot is only engaged when the automatic cherry-pick or CI needs human-like help.
 on:
   # Slash command must come from a comment, so issue_comment is required. The
@@ -262,7 +263,7 @@ jobs:
             });
 
   copilot-on-ci-failure:
-    name: Assign Copilot when a backport CI fails
+    name: Retry CI, then assign Copilot if it keeps failing
     if: |
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
@@ -271,19 +272,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      pull-requests: write
+      actions: write         # re-run failed CI jobs to rule out flakes
+      issues: write          # comment on the PR
+      pull-requests: write   # convert to draft and assign Copilot
     steps:
-      - name: Assign Copilot to fix failing CI
+      - name: Retry CI or assign Copilot
         # https://github.com/actions/github-script/releases
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          # Total CI attempts (initial + retries) before Copilot is engaged.
+          # Flaky failures usually pass on a retry; override with the
+          # AUTOBACKPORT_CI_ATTEMPTS repository variable.
+          MAX_ATTEMPTS: ${{ vars.AUTOBACKPORT_CI_ATTEMPTS || '3' }}
         with:
           github-token: ${{ secrets.AUTOBACKPORT_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
             const headBranch = process.env.HEAD_BRANCH;
+            const runId = Number(process.env.RUN_ID);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            const maxAttempts = Math.max(1, Number(process.env.MAX_ATTEMPTS) || 3);
 
             const { data: prs } = await github.rest.pulls.list({
               owner, repo, state: 'open', head: `${owner}:${headBranch}`,
@@ -300,6 +312,17 @@ jobs:
             );
             if (alreadyAssigned) {
               core.info('Copilot already assigned; leaving it to continue.');
+              return;
+            }
+
+            // Retry the CI run a few times first — many failures are flaky and pass
+            // on a re-run. Only escalate to Copilot once the attempts are exhausted.
+            if (runAttempt < maxAttempts) {
+              await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: runId });
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: `:repeat: Backport CI failed (attempt ${runAttempt}/${maxAttempts}). Re-running the failed jobs to rule out flakiness before involving Copilot. (${process.env.RUN_URL})`,
+              });
               return;
             }
 
@@ -340,7 +363,7 @@ jobs:
             await github.rest.issues.createComment({
               owner, repo, issue_number: pr.number,
               body: [
-                `:robot: @copilot the CI checks on this backport failed (${process.env.RUN_URL}).`,
+                `:robot: @copilot the CI checks on this backport still failed after ${maxAttempts} attempts (${process.env.RUN_URL}), so this is unlikely to be a flake.`,
                 '',
                 'Please fix the failing checks, keeping changes minimal and faithful to the original PR. When green, mark this PR ready for review and summarize what you changed.',
                 '',
