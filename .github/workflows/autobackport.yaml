@@ -1,44 +1,46 @@
 name: Auto backport
 run-name: "Autobackport PR #${{ github.event.issue.number }}"
 
-# A maintainer comments `/autobackport <release-minor>` (e.g. `/autobackport v0.7`)
-# on a merged pull request. This workflow opens a backport pull request against the
-# matching `release/<release-minor>` branch and assigns it to the Copilot coding
-# agent, which cherry-picks the original commits and resolves any conflicts.
+# `/autobackport <branch> [<branch> ...]` (e.g. `/autobackport release/v0.8 release/v0.9`)
+# on a merged PR opens one backport PR per target branch by cherry-picking the PR's
+# squashed merge commit:
+#   * Clean cherry-pick  -> a normal PR is opened; its own CI checks validate it.
+#   * Merge conflict      -> a draft PR is opened and assigned to Copilot.
+#   * CI checks then fail -> the PR is assigned to Copilot to fix them.
+# Copilot is only engaged when the automatic cherry-pick or CI needs human-like help.
 on:
-  # Slash command must come from a comment, so issue_comment is required.
-  # The job-level author_association check gates execution to org members/owners
-  # and repository collaborators. No untrusted code is checked out or executed.
+  # Slash command must come from a comment, so issue_comment is required. The
+  # job-level author_association check gates execution to trusted authors.
   issue_comment: # zizmor: ignore[dangerous-triggers]
     types:
       - created
+  # Re-engage Copilot when a backport PR's CI run finishes unsuccessfully.
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
 
 permissions: {}
 
 jobs:
-  autobackport:
-    name: Open backport PR and assign Copilot
-    runs-on: ubuntu-latest
-    # Only react to `/autobackport ...` comments posted on a pull request by a
-    # trusted author (org member/owner or repository collaborator).
+  prepare:
+    name: Validate and list target branches
     if: |
+      github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/autobackport') &&
       contains(fromJSON('["MEMBER", "OWNER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write        # push the backport branch
-      pull-requests: write   # open the backport PR and assign Copilot
-      issues: write          # comment back on the original PR
+      contents: read
+      issues: write
+    outputs:
+      branches: ${{ steps.prepare.outputs.branches }}
+      merge_sha: ${{ steps.prepare.outputs.merge_sha }}
+      pr_title: ${{ steps.prepare.outputs.pr_title }}
     steps:
-      - name: Checkout repository
-        # https://github.com/actions/checkout/releases
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Validate request and gather PR context
+      - name: Validate request and resolve branches
         id: prepare
         # https://github.com/actions/github-script/releases
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -48,127 +50,181 @@ jobs:
             const prNumber = context.issue.number;
             const commentBody = context.payload.comment.body.trim();
 
+            const comment = (body) => github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
             const fail = async (message) => {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber,
-                body: `:no_entry: Not creating backport: ${message}`,
-              });
+              await comment(`:no_entry: Not creating backport: ${message}`);
               core.setFailed(message);
             };
 
-            // Parse and sanitize the target branch argument,
-            // e.g. `/autobackport release/v0.9`.
-            const targetBranch = (commentBody.split(/\s+/)[1] || '').trim().replace(/[^A-Za-z0-9._/-]/g, '');
-            if (!targetBranch || targetBranch.startsWith('/') || targetBranch.includes('..')) {
-              return fail('invalid target branch. Usage: `/autobackport <branch-name>` (e.g. `/autobackport release/v0.9`).');
+            // Parse and sanitize the target branch arguments.
+            const requested = [...new Set(
+              commentBody.split(/\s+/).slice(1)
+                .map((t) => t.replace(/[^A-Za-z0-9._/-]/g, ''))
+                .filter((t) => t && !t.startsWith('/') && !t.includes('..')),
+            )];
+            if (requested.length === 0) {
+              return fail('no valid target branch given. Usage: `/autobackport <branch> [<branch> ...]` (e.g. `/autobackport release/v0.8 release/v0.9`).');
             }
 
-            // The target branch must exist.
-            try {
-              await github.rest.repos.getBranch({ owner, repo, branch: targetBranch });
-            } catch (error) {
-              if (error.status === 404) {
-                return fail(`target branch \`${targetBranch}\` does not exist.`);
-              }
-              throw error;
-            }
-
-            // The source PR must be merged so there are commits to backport.
+            // The source PR must be merged so there is a squashed commit to backport.
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             if (!pr.merged) {
               return fail(`pull request #${prNumber} is not merged yet. Backport once it is merged.`);
             }
+            if (!pr.merge_commit_sha) {
+              return fail(`could not determine the merge commit for #${prNumber}.`);
+            }
 
-            const commits = await github.paginate(github.rest.pulls.listCommits, {
-              owner, repo, pull_number: prNumber, per_page: 100,
-            });
-            const commitList = commits.map((c) => `- ${c.sha} ${c.commit.message.split('\n')[0]}`).join('\n');
+            // Keep only target branches that exist.
+            const valid = [];
+            const invalid = [];
+            for (const branch of requested) {
+              try {
+                await github.rest.repos.getBranch({ owner, repo, branch });
+                valid.push(branch);
+              } catch (error) {
+                if (error.status === 404) { invalid.push(branch); continue; }
+                throw error;
+              }
+            }
+            if (invalid.length > 0) {
+              await comment(`:warning: Skipping non-existent branch(es): ${invalid.map((b) => `\`${b}\``).join(', ')}.`);
+            }
+            if (valid.length === 0) {
+              return fail('none of the requested target branches exist.');
+            }
 
-            const backportBranch = `autobackport/${targetBranch.replace(/\//g, '-')}-pr-${prNumber}`;
-
-            core.setOutput('target_branch', targetBranch);
-            core.setOutput('backport_branch', backportBranch);
-            core.setOutput('merge_sha', pr.merge_commit_sha || '');
+            core.setOutput('branches', JSON.stringify(valid));
+            core.setOutput('merge_sha', pr.merge_commit_sha);
             core.setOutput('pr_title', pr.title);
 
-            const body = [
-              `## Automated backport of #${prNumber} to \`${targetBranch}\``,
-              '',
-              `@copilot please backport the changes from #${prNumber} ("${pr.title}") onto this branch, which is based on \`${targetBranch}\`.`,
-              '',
-              '### What to do',
-              `1. Cherry-pick the commit(s) listed below from #${prNumber} onto this branch, in order.`,
-              '2. Resolve any merge conflicts. Keep the changes minimal and faithful to the original PR — do not include unrelated changes, and keep the diff limited to what the original PR changed.',
-              '3. Run CI locally and make it pass **before** marking this PR ready for review:',
-              '   - `make build-bin`',
-              '   - `make test`',
-              '   - `make validate`',
-              '   Iterate on failures (adapting the cherry-picked changes to the target branch where needed) until all three pass.',
-              '4. Once CI is green, mark this PR ready for review and summarize what you changed and why.',
-              '',
-              '### If you get stuck',
-              'Spend a reasonable amount of effort, but if the conflicts or CI failures are too deep to resolve confidently (for example the code has diverged substantially on this branch, or a fix would require non-trivial product decisions), **do not force a broken or speculative backport**. Instead:',
-              '- Leave this PR as a draft.',
-              '- Post a comment explaining exactly what is blocking the backport (which files/commits conflict, which tests fail and why) so a human maintainer can take over.',
-              '',
-              pr.merge_commit_sha ? `Merge commit: \`${pr.merge_commit_sha}\`` : '',
-              '',
-              'Commits to backport:',
-              commitList,
-              '',
-              `Opened automatically from a \`/autobackport ${targetBranch}\` comment by @${context.actor}.`,
-            ].filter((line) => line !== null && line !== undefined).join('\n');
+  backport:
+    name: "Backport to ${{ matrix.branch }}"
+    needs: prepare
+    if: needs.prepare.outputs.branches != '' && needs.prepare.outputs.branches != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write        # push the backport branch
+      pull-requests: write   # open the backport PR and assign Copilot
+      issues: write          # comment back on the original PR
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.prepare.outputs.branches) }}
+    steps:
+      - name: Checkout repository
+        # https://github.com/actions/checkout/releases
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-            const fs = require('fs');
-            fs.writeFileSync(`${process.env.RUNNER_TEMP}/backport-body.md`, body, 'utf8');
-
-      - name: Create backport branch
+      - name: Cherry-pick squashed commit
+        id: cherry
         env:
-          TARGET_BRANCH: ${{ steps.prepare.outputs.target_branch }}
-          BACKPORT_BRANCH: ${{ steps.prepare.outputs.backport_branch }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          MERGE_SHA: ${{ needs.prepare.outputs.merge_sha }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          # Branch off the target branch. The empty commit gives Copilot a
-          # branch that is ahead of the base so a pull request can be opened; Copilot
-          # replaces it with the real cherry-picked commits.
+
+          BACKPORT_BRANCH="autobackport/$(echo "${TARGET_BRANCH}" | tr '/' '-')-pr-${PR_NUMBER}"
+          echo "backport_branch=${BACKPORT_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          # Make sure the target branch and the squashed commit are available locally.
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          git fetch --no-tags origin "${MERGE_SHA}" || true
           git checkout -b "${BACKPORT_BRANCH}" "origin/${TARGET_BRANCH}"
-          git commit --allow-empty -m "Backport PR #${PR_NUMBER} to ${TARGET_BRANCH} (initialized by autobackport)"
+
+          # Take the squashed merge commit. If the PR was merged with a merge commit
+          # (two parents) instead of squashed, pick the first-parent diff.
+          PARENTS=$(git rev-list --parents -n1 "${MERGE_SHA}" | wc -w)
+          if [ "${PARENTS}" -ge 3 ]; then
+            CP_ARGS="-m 1"
+          else
+            CP_ARGS=""
+          fi
+
+          if git cherry-pick -x ${CP_ARGS} "${MERGE_SHA}"; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            # Abandon the partial cherry-pick; Copilot will redo it and resolve conflicts.
+            git cherry-pick --abort || true
+            git reset --hard "origin/${TARGET_BRANCH}"
+            git commit --allow-empty -m "Backport PR #${PR_NUMBER} to ${TARGET_BRANCH} (initialized by autobackport)"
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
           git push origin "${BACKPORT_BRANCH}"
 
-      - name: Open PR and assign Copilot
+      - name: Open PR and (on conflict) assign Copilot
         # https://github.com/actions/github-script/releases
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          TARGET_BRANCH: ${{ steps.prepare.outputs.target_branch }}
-          BACKPORT_BRANCH: ${{ steps.prepare.outputs.backport_branch }}
-          PR_TITLE: ${{ steps.prepare.outputs.pr_title }}
+          TARGET_BRANCH: ${{ matrix.branch }}
+          BACKPORT_BRANCH: ${{ steps.cherry.outputs.backport_branch }}
+          MERGE_SHA: ${{ needs.prepare.outputs.merge_sha }}
+          PR_TITLE: ${{ needs.prepare.outputs.pr_title }}
+          CHERRY_RESULT: ${{ steps.cherry.outputs.result }}
         with:
           # Assigning the Copilot coding agent requires a user/PAT token; the default
-          # GITHUB_TOKEN cannot assign it. Provide a PAT with `repo` scope (and Copilot
-          # access) as the AUTOBACKPORT_TOKEN secret. Falls back to GITHUB_TOKEN, in
-          # which case the PR is still opened but Copilot must be assigned manually.
+          # GITHUB_TOKEN cannot assign it, and a PAT-authored PR is also what lets the
+          # PR's own CI run. Provide a PAT with `repo` scope (and Copilot access) as the
+          # AUTOBACKPORT_TOKEN secret. Falls back to GITHUB_TOKEN (PR still opened, but
+          # Copilot must be assigned manually and CI may not trigger automatically).
           github-token: ${{ secrets.AUTOBACKPORT_TOKEN || github.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.issue.number;
             const targetBranch = process.env.TARGET_BRANCH;
             const backportBranch = process.env.BACKPORT_BRANCH;
-            const fs = require('fs');
-            const body = fs.readFileSync(`${process.env.RUNNER_TEMP}/backport-body.md`, 'utf8');
+            const mergeSha = process.env.MERGE_SHA;
+            const prTitle = process.env.PR_TITLE;
+            const conflict = process.env.CHERRY_RESULT === 'conflict';
 
-            // Create the backport pull request as a draft against the target branch.
+            const cleanBody = [
+              `## Automated backport of #${prNumber} to \`${targetBranch}\``,
+              '',
+              `The squashed commit \`${mergeSha}\` from #${prNumber} ("${prTitle}") was cherry-picked cleanly onto \`${targetBranch}\`. This PR's own CI checks will validate the backport.`,
+              '',
+              `Opened automatically from a \`/autobackport\` comment by @${context.actor}.`,
+            ].join('\n');
+
+            const conflictBody = [
+              `## Automated backport of #${prNumber} to \`${targetBranch}\``,
+              '',
+              `@copilot cherry-picking the squashed commit \`${mergeSha}\` from #${prNumber} ("${prTitle}") onto \`${targetBranch}\` hit merge conflicts, so this branch only has an empty starter commit.`,
+              '',
+              '### What to do',
+              `1. Cherry-pick \`${mergeSha}\` onto this branch and resolve the conflicts. Keep the diff minimal and faithful to the original PR — no unrelated changes.`,
+              `2. Make sure this PR's CI checks pass, then mark it ready for review and summarize what you changed.`,
+              '',
+              '### If you get stuck',
+              'If the conflicts are too deep to resolve confidently (the code has diverged substantially on this branch, or a correct fix needs product decisions), **do not force a broken backport**. Leave this PR as a draft and comment explaining exactly what is blocking it so a human can take over.',
+              '',
+              `Opened automatically from a \`/autobackport\` comment by @${context.actor}.`,
+            ].join('\n');
+
+            // Clean cherry-pick -> normal PR; conflict -> draft PR for Copilot.
             const { data: backportPr } = await github.rest.pulls.create({
               owner, repo,
-              title: `[backport ${targetBranch}] ${process.env.PR_TITLE}`,
+              title: `[backport ${targetBranch}] ${prTitle}`,
               head: backportBranch,
               base: targetBranch,
-              body,
-              draft: true,
+              body: conflict ? conflictBody : cleanBody,
+              draft: conflict,
             });
 
-            // Resolve the Copilot coding agent actor id for this repository.
+            if (!conflict) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `:white_check_mark: Cherry-picked cleanly and opened backport PR #${backportPr.number} to \`${targetBranch}\`. Its CI checks will validate it.`,
+              });
+              return;
+            }
+
+            // Resolve and assign the Copilot coding agent for conflict resolution.
             const { repository } = await github.graphql(
               `query($owner: String!, $repo: String!) {
                  repository(owner: $owner, name: $repo) {
@@ -186,16 +242,15 @@ jobs:
             if (!copilot) {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
-                body: `Opened backport PR #${backportPr.number}, but the Copilot coding agent is not available on this repository, so it was not assigned. Assign it manually to run the backport.`,
+                body: `:warning: The cherry-pick to \`${targetBranch}\` had conflicts and opened draft PR #${backportPr.number}, but the Copilot coding agent is not available here, so it was not assigned. Resolve the conflicts manually.`,
               });
               return;
             }
 
-            // Assign Copilot to the backport PR so it performs the cherry-pick.
             await github.graphql(
               `mutation($assignableId: ID!, $actorIds: [ID!]!) {
                  replaceActorsForAssignable(input: { assignableId: $assignableId, actorIds: $actorIds }) {
-                   assignable { ... on PullRequest { id number } }
+                   assignable { ... on PullRequest { number } }
                  }
                }`,
               { assignableId: backportPr.node_id, actorIds: [copilot.id] },
@@ -203,5 +258,92 @@ jobs:
 
             await github.rest.issues.createComment({
               owner, repo, issue_number: prNumber,
-              body: `:robot: Opened backport PR #${backportPr.number} to \`${targetBranch}\` and assigned it to Copilot.`,
+              body: `:robot: The cherry-pick to \`${targetBranch}\` had conflicts. Opened draft PR #${backportPr.number} and assigned it to Copilot to resolve them.`,
+            });
+
+  copilot-on-ci-failure:
+    name: Assign Copilot when a backport CI fails
+    if: |
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      startsWith(github.event.workflow_run.head_branch, 'autobackport/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Assign Copilot to fix failing CI
+        # https://github.com/actions/github-script/releases
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        with:
+          github-token: ${{ secrets.AUTOBACKPORT_TOKEN || github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const headBranch = process.env.HEAD_BRANCH;
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${headBranch}`,
+            });
+            if (prs.length === 0) {
+              core.info(`No open PR for ${headBranch}; nothing to do.`);
+              return;
+            }
+            const pr = prs[0];
+
+            // Only assign once: if Copilot is already on the PR it is already working.
+            const alreadyAssigned = (pr.assignees || []).some(
+              (a) => a.login === 'Copilot' || a.login === 'copilot-swe-agent',
+            );
+            if (alreadyAssigned) {
+              core.info('Copilot already assigned; leaving it to continue.');
+              return;
+            }
+
+            const { repository } = await github.graphql(
+              `query($owner: String!, $repo: String!) {
+                 repository(owner: $owner, name: $repo) {
+                   suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+                     nodes { login __typename ... on Bot { id } ... on User { id } }
+                   }
+                 }
+               }`,
+              { owner, repo },
+            );
+            const copilot = repository.suggestedActors.nodes.find(
+              (node) => node.login === 'copilot-swe-agent' || node.login === 'Copilot',
+            );
+            if (!copilot) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: `:warning: CI failed on this backport (${process.env.RUN_URL}), but the Copilot coding agent is not available here to fix it. Please fix the failing checks manually.`,
+              });
+              return;
+            }
+
+            // Mark the PR as draft and hand it to Copilot to fix the failing checks.
+            await github.graphql(
+              `mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { number } } }`,
+              { id: pr.node_id },
+            );
+            await github.graphql(
+              `mutation($assignableId: ID!, $actorIds: [ID!]!) {
+                 replaceActorsForAssignable(input: { assignableId: $assignableId, actorIds: $actorIds }) {
+                   assignable { ... on PullRequest { number } }
+                 }
+               }`,
+              { assignableId: pr.node_id, actorIds: [copilot.id] },
+            );
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pr.number,
+              body: [
+                `:robot: @copilot the CI checks on this backport failed (${process.env.RUN_URL}).`,
+                '',
+                'Please fix the failing checks, keeping changes minimal and faithful to the original PR. When green, mark this PR ready for review and summarize what you changed.',
+                '',
+                'If the failures are too deep to resolve confidently, leave this PR as a draft and comment explaining what is blocking it so a human can take over.',
+              ].join('\n'),
             });
